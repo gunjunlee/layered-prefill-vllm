@@ -5,6 +5,10 @@ import pytest
 import regex as re
 import torch
 
+from vllm.model_executor.layered_prefill import (
+    get_layer_group_range,
+    layer_group_context,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -17,6 +21,32 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 
 DEVICE_TYPE = current_platform.device_type
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "start,end,groups,expected",
+    [
+        (0, 16, 2, [(0, 8), (8, 16)]),
+        (16, 32, 2, [(16, 24), (24, 32)]),
+        (7, 16, 2, [(7, 12), (12, 16)]),
+        (16, 32, 3, [(16, 22), (22, 27), (27, 32)]),
+    ],
+)
+def test_layer_groups_partition_the_local_pipeline_rank(start, end, groups, expected):
+    actual = []
+    for idx in range(groups):
+        with layer_group_context(idx, groups):
+            actual.append(get_layer_group_range(start, end))
+    assert actual == expected
+    assert get_layer_group_range(start, end) == (start, end)
+
+
+@pytest.mark.cpu_test
+def test_layer_groups_reject_empty_groups_and_restore_context():
+    with pytest.raises(ValueError, match="nonempty"), layer_group_context(0, 3):
+        get_layer_group_range(16, 18)
+    assert get_layer_group_range(16, 18) == (16, 18)
 
 
 class ModuleWithBatchNorm(torch.nn.Module):

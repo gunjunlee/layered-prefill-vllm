@@ -314,6 +314,11 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # One local execution per PP rank, including idle ranks. Nested outputs
+    # have layer_group_idx set and never contain another pipeline plan.
+    layered_prefill_outputs: list["SchedulerOutput"] | None = None
+    layer_group_idx: int | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

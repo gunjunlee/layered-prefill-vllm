@@ -58,6 +58,39 @@ from vllm.v1.attention.backend import AttentionCGSupport
 DEVICE_TYPE = current_platform.device_type
 
 
+@pytest.mark.cpu_test
+def test_layered_prefill_selects_synchronous_eager_runner(monkeypatch):
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    model = ModelConfig(model="Qwen/Qwen3-0.6B", max_model_len=256)
+    config = VllmConfig(
+        model_config=model,
+        scheduler_config=SchedulerConfig(
+            max_model_len=256, is_encoder_decoder=False, num_layer_groups=2
+        ),
+    )
+    assert config.max_concurrent_batches == 1
+    assert not config.use_v2_model_runner
+    assert not config.scheduler_config.async_scheduling
+    assert model.enforce_eager
+    assert config.compilation_config.mode == CompilationMode.NONE
+    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+
+
+@pytest.mark.cpu_test
+def test_layered_prefill_rejects_more_groups_than_local_layers():
+    model = ModelConfig(model="Qwen/Qwen3-0.6B", max_model_len=256)
+    with pytest.raises(ValueError, match="layer count on any PP rank"):
+        VllmConfig(
+            model_config=model,
+            parallel_config=ParallelConfig(pipeline_parallel_size=2),
+            scheduler_config=SchedulerConfig(
+                max_model_len=256,
+                is_encoder_decoder=False,
+                num_layer_groups=model.hf_text_config.num_hidden_layers,
+            ),
+        )
+
+
 def test_nested_rope_validation_patch_preserves_flat_rope_parameters(monkeypatch):
     calls = []
 

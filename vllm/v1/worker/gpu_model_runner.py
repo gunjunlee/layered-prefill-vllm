@@ -58,6 +58,7 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping, LoRAMappingType
+from vllm.model_executor.layered_prefill import layer_group_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -3594,7 +3595,10 @@ class GPUModelRunner(
             if num_input_tokens > num_scheduled_tokens:
                 self.positions[num_scheduled_tokens:num_input_tokens].zero_()
 
-        if is_first_rank:
+        if scheduler_output.layer_group_idx is not None:
+            # Local continuations also supply intermediates on the first rank.
+            pass
+        elif is_first_rank:
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
@@ -4410,6 +4414,10 @@ class GPUModelRunner(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
+            layer_group_context(
+                scheduler_output.layer_group_idx,
+                self.scheduler_config.num_layer_groups,
+            ),
         ):
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -4418,6 +4426,11 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        if scheduler_output.layer_group_idx is not None and isinstance(
+            model_output, IntermediateTensors
+        ):
+            return model_output
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

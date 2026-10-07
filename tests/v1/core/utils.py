@@ -72,6 +72,7 @@ def create_scheduler(
     skip_tokenizer_init: bool = False,
     async_scheduling: bool = False,
     pipeline_parallel_size: int = 1,
+    num_layer_groups: int = 1,
     data_parallel_size: int = 1,
     num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
     use_ec_connector: bool = False,
@@ -125,6 +126,7 @@ def create_scheduler(
         long_prefill_token_threshold_adaptive=(long_prefill_token_threshold_adaptive),
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
+        num_layer_groups=num_layer_groups,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
         # Ensure admission/preemption mechanics are deterministic
@@ -202,6 +204,9 @@ def create_scheduler(
         parallel_config=ParallelConfig(
             pipeline_parallel_size=pipeline_parallel_size,
             data_parallel_size=data_parallel_size,
+            distributed_executor_backend="mp"
+            if pipeline_parallel_size > 1 or num_layer_groups > 1
+            else None,
         ),
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
@@ -226,7 +231,7 @@ def create_scheduler(
     cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)
     if scheduler_cls is None:
-        scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
+        scheduler_cls = scheduler_config.get_scheduler_cls()
     scheduler = scheduler_cls(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,

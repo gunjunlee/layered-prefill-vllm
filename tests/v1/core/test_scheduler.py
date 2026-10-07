@@ -77,6 +77,140 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("pp_size,num_groups", [(1, 2), (2, 2), (2, 3), (3, 2)])
+def test_layered_prefill_advances_within_each_pipeline_rank(pp_size, num_groups):
+    """A request occupies a PP rank for all its local layer groups."""
+    scheduler = create_scheduler(
+        model="Qwen/Qwen3-0.6B",
+        pipeline_parallel_size=pp_size,
+        num_layer_groups=num_groups,
+    )
+    requests = create_requests(num_requests=2, num_tokens=16, max_tokens=2)
+    for request in requests:
+        scheduler.add_request(request)
+    for tick in range((pp_size + 1) * num_groups):
+        output = scheduler.schedule()
+        stages = output.layered_prefill_outputs
+        assert stages is not None
+        for rank, stage in enumerate(stages):
+            active = []
+            for index, request in enumerate(requests):
+                progress = tick - index * num_groups
+                if rank * num_groups <= progress < (rank + 1) * num_groups:
+                    active.append(request.request_id)
+                    assert stage.layer_group_idx == progress % num_groups
+            assert list(stage.num_scheduled_tokens) == active
+        completed = stages[-1]
+        ids = list(completed.num_scheduled_tokens)
+        if completed.layer_group_idx != num_groups - 1:
+            ids = []
+        model_output = ModelRunnerOutput(
+            req_ids=ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(ids)},
+            sampled_token_ids=[[123] for _ in ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        )
+        scheduler.update_from_output(output, model_output)
+        for index, request in enumerate(requests):
+            done = tick >= (pp_size + index) * num_groups - 1
+            assert request.num_computed_tokens == (16 if done else 0)
+            assert request.num_output_tokens == int(done)
+    # Once prefill drains, decode remains a normal full-depth batch.
+    assert scheduler.schedule().layered_prefill_outputs is None
+
+
+def test_layered_prefill_abort_releases_pipeline_slot():
+    scheduler = create_scheduler(
+        model="Qwen/Qwen3-0.6B", pipeline_parallel_size=2, num_layer_groups=2
+    )
+    requests = create_requests(num_requests=2, num_tokens=16)
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.schedule()
+    scheduler.finish_requests([requests[0].request_id], RequestStatus.FINISHED_ABORTED)
+    output = scheduler.schedule()
+    assert requests[0].request_id in output.finished_req_ids
+    assert output.layered_prefill_outputs[0].num_scheduled_tokens == {
+        requests[1].request_id: 16
+    }
+    assert output.layered_prefill_outputs[0].layer_group_idx == 0
+    assert not output.layered_prefill_outputs[1].num_scheduled_tokens
+
+
+def test_layered_prefill_keeps_partial_kv_out_of_prefix_cache():
+    scheduler = create_scheduler(
+        model="Qwen/Qwen3-0.6B",
+        pipeline_parallel_size=2,
+        num_layer_groups=2,
+        enable_prefix_caching=True,
+    )
+    first, second = create_requests(num_requests=2, num_tokens=32, same_prompt=True)
+    scheduler.add_request(first)
+    for _ in range(3):
+        scheduler.schedule()
+        _, cached_tokens, _ = scheduler.kv_cache_manager.get_computed_blocks(second)
+        assert cached_tokens == 0
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[first.request_id],
+            req_id_to_index={first.request_id: 0},
+            sampled_token_ids=[[123]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    _, cached_tokens, _ = scheduler.kv_cache_manager.get_computed_blocks(second)
+    assert cached_tokens > 0
+
+
+def test_layered_prefill_pause_preserves_local_group():
+    scheduler = create_scheduler(
+        model="Qwen/Qwen3-0.6B", pipeline_parallel_size=2, num_layer_groups=2
+    )
+    (request,) = create_requests(num_requests=1)
+    scheduler.add_request(request)
+    scheduler.schedule()
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    scheduler.set_pause_state(PauseState.UNPAUSED)
+    assert scheduler.schedule().layered_prefill_outputs[0].layer_group_idx == 1
+
+
+def test_layered_prefill_commits_each_token_chunk_once():
+    scheduler = create_scheduler(
+        model="Qwen/Qwen3-0.6B",
+        pipeline_parallel_size=2,
+        num_layer_groups=2,
+        max_num_batched_tokens=16,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=48)
+    scheduler.add_request(request)
+    for chunk in range(3):
+        for tick in range(4):
+            output = scheduler.schedule()
+            assert output.num_scheduled_tokens == {request.request_id: 16}
+            completed = tick == 3
+            ids = [request.request_id] if completed else []
+            scheduler.update_from_output(
+                output,
+                ModelRunnerOutput(
+                    req_ids=ids,
+                    req_id_to_index={req_id: i for i, req_id in enumerate(ids)},
+                    sampled_token_ids=[[123] if chunk == 2 else []] if ids else [],
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    pooler_output=[],
+                ),
+            )
+            assert request.num_computed_tokens == 16 * (chunk + completed)
+            assert request.num_output_tokens == int(chunk == 2 and completed)
+
+
 def test_make_scheduled_encoder_input_stats_output_embeddings():
     scheduler = create_scheduler()
     mm_features = [

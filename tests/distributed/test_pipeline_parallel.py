@@ -23,6 +23,71 @@ from ..utils import compare_two_settings, create_new_process_for_each_test
 
 logger = init_logger("test_pipeline_parallel")
 
+
+@pytest.mark.parametrize("model", ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-30B-A3B"])
+@pytest.mark.parametrize(
+    "tp,pp,ep", [(1, 2, False), (2, 1, False), (2, 1, True), (2, 2, True)]
+)
+def test_layered_prefill_matches_full_depth(
+    vllm_runner, model, tp, pp, ep, num_gpus_available, monkeypatch
+):
+    """Layer boundaries must preserve generation with TP, PP and MoE EP."""
+    if num_gpus_available < tp * pp:
+        pytest.skip(f"Requires {tp * pp} GPUs")
+    if ep and "A3B" not in model:
+        pytest.skip("EP applies to the MoE model")
+    _compare_layered_prefill(vllm_runner, model, tp, pp, ep, monkeypatch)
+
+
+@create_new_process_for_each_test()
+def _compare_layered_prefill(vllm_runner, model, tp, pp, ep, monkeypatch):
+    from tests.models.utils import check_logprobs_close
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+
+    prompts = [
+        "The capital of France is",
+        "Explain why the sky is blue in one sentence.",
+        "Write a Python function to add two numbers.",
+    ]
+    results = []
+    for groups in (1, 2):
+        with vllm_runner(
+            model,
+            tensor_parallel_size=tp,
+            pipeline_parallel_size=pp,
+            enable_expert_parallel=ep,
+            distributed_executor_backend="mp",
+            enforce_eager=True,
+            async_scheduling=False,
+            num_layer_groups=groups,
+            max_model_len=256,
+            max_num_batched_tokens=32,
+            max_num_seqs=4,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+            gpu_memory_utilization=0.5 if "A3B" in model else 0.1,
+            kv_cache_memory_bytes=256 * 1024**2,
+        ) as runner:
+            results.append(runner.generate_greedy_logprobs(prompts, 8, 5))
+            # Reuse completed prefixes after the pipeline has drained.
+            repeated = runner.generate_greedy_logprobs(prompts, 8, 5)
+            check_logprobs_close(
+                outputs_0_lst=results[-1],
+                outputs_1_lst=repeated,
+                name_0="cold",
+                name_1="prefix cache hit",
+                always_check_logprobs=True,
+            )
+    check_logprobs_close(
+        outputs_0_lst=results[0],
+        outputs_1_lst=results[1],
+        name_0="full depth",
+        name_1="layered prefill",
+        always_check_logprobs=True,
+    )
+
+
 VLLM_MULTI_NODE = os.getenv("VLLM_MULTI_NODE", "0") == "1"
 
 

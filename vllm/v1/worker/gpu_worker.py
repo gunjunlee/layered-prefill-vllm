@@ -93,6 +93,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.layered_prefill import LayeredPrefillRunner
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -234,6 +235,7 @@ class Worker(WorkerBase):
 
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
+        self._layered_prefill_runner: LayeredPrefillRunner | None = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -709,6 +711,16 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+        if self.vllm_config.scheduler_config.num_layer_groups > 1:
+            # Retained hidden states and residuals outlive a group forward.
+            # All requests in a wave share one max_num_batched_tokens budget.
+            activation_bytes = (
+                2
+                * self.vllm_config.scheduler_config.max_num_batched_tokens
+                * self.model_config.get_hidden_size()
+                * torch.empty((), dtype=self.model_config.dtype).element_size()
+            )
+            self.available_kv_cache_memory_bytes -= activation_bytes
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
@@ -1270,6 +1282,15 @@ class Worker(WorkerBase):
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
+
+        if scheduler_output.layered_prefill_outputs is not None:
+            if self._layered_prefill_runner is None:
+                self._layered_prefill_runner = LayeredPrefillRunner(
+                    self.model_runner,
+                    self.vllm_config.scheduler_config.num_layer_groups,
+                )
+            with self.annotate_profile(scheduler_output):
+                return self._layered_prefill_runner.execute_model(scheduler_output)
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0

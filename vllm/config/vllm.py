@@ -591,6 +591,10 @@ class VllmConfig:
 
     @property
     def max_concurrent_batches(self) -> int:
+        if self.scheduler_config.num_layer_groups > 1:
+            # Each iteration already contains concurrent work for all PP ranks.
+            # Settle its last-rank output before admitting the next batch.
+            return 1
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size
@@ -717,6 +721,10 @@ class VllmConfig:
 
     @property
     def use_v2_model_runner(self) -> bool:
+        if self.scheduler_config.num_layer_groups > 1:
+            if envs.VLLM_USE_V2_MODEL_RUNNER:
+                raise ValueError("Layered prefill requires Model Runner V1.")
+            return False
         if self.attention_config.hisparse_config is not None:
             if envs.VLLM_USE_V2_MODEL_RUNNER is False:
                 raise ValueError(
@@ -1454,6 +1462,55 @@ class VllmConfig:
         self.engram_config.verify_parallel_config(self.parallel_config)
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
+    def _validate_layered_prefill(self) -> None:
+        scheduler = self.scheduler_config
+        parallel = self.parallel_config
+        if scheduler.async_scheduling or scheduler.scheduler_cls is not None:
+            raise ValueError(
+                "Layered prefill requires synchronous scheduling and the "
+                "built-in scheduler."
+            )
+        scheduler.async_scheduling = False
+        unsupported = {
+            "speculative decoding": self.speculative_config is not None,
+            "KV transfer": self.kv_transfer_config is not None,
+            "encoder transfer": self.ec_transfer_config is not None,
+            "data parallelism": parallel.data_parallel_size > 1,
+            "context parallelism": parallel.decode_context_parallel_size > 1
+            or parallel.prefill_context_parallel_size > 1,
+            "DBO": parallel.enable_dbo,
+            "EPLB": parallel.enable_eplb,
+            "sequence parallelism": self.compilation_config.pass_config.enable_sp,
+            "HiSparse": self.attention_config.hisparse_config is not None,
+        }
+        for feature, enabled in unsupported.items():
+            if enabled:
+                raise ValueError(f"Layered prefill does not yet support {feature}.")
+        model = self.model_config
+        if model is None:
+            return
+        supported = {"Qwen2ForCausalLM", "Qwen3ForCausalLM", "Qwen3MoeForCausalLM"}
+        if not supported.intersection(model.architectures):
+            raise ValueError(
+                "Layered prefill currently supports Qwen2, Qwen3 and Qwen3 MoE."
+            )
+        if model.runner_type != "generate" or model.is_multimodal_model:
+            raise ValueError("Layered prefill requires text generation.")
+        from vllm.distributed.utils import get_pp_indices
+
+        for rank in range(parallel.pipeline_parallel_size):
+            start, end = get_pp_indices(
+                model.hf_text_config.num_hidden_layers,
+                rank,
+                parallel.pipeline_parallel_size,
+            )
+            if end - start < scheduler.num_layer_groups:
+                raise ValueError(
+                    "num_layer_groups must not exceed the layer count on any PP rank."
+                )
+        model.enforce_eager = True
+        logger.info("Layered prefill uses eager execution with Model Runner V1.")
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
         # To give each torch profile run a unique instance name.
@@ -1464,6 +1521,9 @@ class VllmConfig:
             # and this view's empty architecture list makes the model-dependent checks
             # below unsafe (e.g. use_mla resolves the architecture registry).
             return
+
+        if self.scheduler_config.num_layer_groups > 1:
+            self._validate_layered_prefill()
 
         self._resolve_mm_encoder_only()
 
@@ -1586,6 +1646,11 @@ class VllmConfig:
 
         executor_backend = self.parallel_config.distributed_executor_backend
         executor_class = Executor.get_class(self)
+        if self.scheduler_config.num_layer_groups > 1 and executor_backend not in (
+            "mp",
+            "uni",
+        ):
+            raise ValueError("Layered prefill requires the mp or uni executor.")
         executor_supports_async_sched = executor_class.supports_async_scheduling()
         uses_rocm_deepep_ht_dbo = (
             current_platform.is_rocm()
