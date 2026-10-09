@@ -581,6 +581,78 @@ def test_wrapper_falls_through_on_runtime_mode_mismatch():
     assert not wrapper.entries
 
 
+@pytest.mark.parametrize("mode_name", ["PIECEWISE", "FULL"])
+def test_layer_groups_replay_distinct_graphs(cuda_capture_stream, mode_name):
+    """Equal batch shapes must replay the selected local group or full depth."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphWrapper,
+        eager_break_during_capture,
+    )
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
+    from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor, set_forward_context
+    from vllm.model_executor.layered_prefill import (
+        get_layer_group_range,
+        layer_group_context,
+    )
+    from vllm.sequence import IntermediateTensors
+
+    @eager_break_during_capture
+    def attention(x, output):
+        output.copy_(x)
+
+    forwards = []
+
+    def model(x):
+        start, end = get_layer_group_range(0, 4)
+        forwards.append((start, end))
+        for layer in range(start, end):
+            output = torch.empty_like(x)
+            attention(x + layer + 1, output)
+            x = output
+        return IntermediateTensors({"hidden_states": x})
+
+    mode = CUDAGraphMode[mode_name]
+    config = _mock_vllm_config()
+    config.use_cumem_cudagraph_pool = False
+    wrapper_type = (
+        BreakableCUDAGraphWrapper if mode_name == "PIECEWISE" else CUDAGraphWrapper
+    )
+    wrapper = wrapper_type(model, config, runtime_mode=mode)
+    inputs = torch.ones(4, device="cuda")
+
+    def run(group):
+        with (
+            layer_group_context(group, 2),
+            set_forward_context(
+                None,
+                config,
+                cudagraph_runtime_mode=mode,
+                batch_descriptor=BatchDescriptor(4, layer_group_idx=group),
+            ),
+        ):
+            output = wrapper(inputs)
+            assert isinstance(output, IntermediateTensors)
+            return output["hidden_states"]
+
+    set_cudagraph_capturing_enabled(True)
+    try:
+        for group in (None, 0, 1):
+            run(group)
+    finally:
+        set_cudagraph_capturing_enabled(False)
+
+    assert forwards == [(0, 4), (0, 2), (2, 4)]
+    forwards.clear()
+    for value, group in enumerate((1, None, 0, 1, 0, None)):
+        inputs.fill_(value)
+        result = run(group)
+        expected = value + {None: 10, 0: 3, 1: 7}[group]
+        torch.testing.assert_close(result, torch.full_like(inputs, expected))
+    assert not forwards  # Replays must not re-enter the Python layer loop.
+
+
 def test_wrapper_captures_on_runtime_mode_match():
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
     from vllm.config import CUDAGraphMode

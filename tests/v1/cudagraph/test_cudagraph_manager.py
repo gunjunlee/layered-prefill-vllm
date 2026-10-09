@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +23,7 @@ from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBuffers
+from vllm.v1.worker.gpu.layered_prefill import LayeredModelCudaGraphManager
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 from vllm.v1.worker.gpu.spec_decode.autoregressive import (
     cudagraph_utils as spec_cudagraph_utils,
@@ -56,6 +58,108 @@ def _create_vllm_config() -> MagicMock:
     vllm_config.num_speculative_tokens = 0
     vllm_config.use_cumem_cudagraph_pool = False
     return vllm_config
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.FULL_AND_PIECEWISE])
+def test_layered_capture_keys_cover_prefill_groups_and_full_depth_decode(
+    monkeypatch, mode
+):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None
+    )
+    config = _create_vllm_config()
+    config.scheduler_config.num_layer_groups = 2
+    manager = LayeredModelCudaGraphManager(config, torch.device("cpu"), mode, 1)
+    manager._graphs_captured = True
+    prefill = manager.dispatch(1, 4, None, 0)
+    captured = manager._capture_descs[prefill.cg_mode]
+    assert all(replace(prefill, layer_group_idx=g) in captured for g in (None, 0, 1))
+    decode = manager.dispatch(4, 4, 1, 0, max_query_len=1)
+    assert decode.layer_group_idx is None
+    assert decode in manager._capture_descs[CUDAGraphMode.FULL]
+
+
+@pytest.mark.parametrize("pp_rank,pp_size", [(0, 1), (0, 2), (1, 2)])
+def test_layered_capture_runs_local_layers_and_retains_both_output_types(
+    monkeypatch, pp_rank, pp_size
+):
+    """Exercise capture/replay orchestration on CPU with a small layer stack."""
+    from vllm.model_executor.layered_prefill import get_layer_group_range
+    from vllm.sequence import IntermediateTensors
+
+    first, last = pp_rank == 0, pp_rank == pp_size - 1
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=first, is_last_rank=last),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils, "set_forward_context", lambda *a, **k: nullcontext()
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils, "prepare_inputs_to_capture", lambda *a, **k: ({}, {})
+    )
+    monkeypatch.setattr(gpu_cudagraph_utils, "get_offloader", MagicMock)
+    config = _create_vllm_config()
+    config.scheduler_config.num_layer_groups = 2
+    manager = LayeredModelCudaGraphManager(
+        config, torch.device("cpu"), CUDAGraphMode.FULL, 1
+    )
+    observed = []
+
+    class Model(torch.nn.Module):
+        def forward(self, input_ids, positions, intermediate_tensors, **kwargs):
+            start, end = get_layer_group_range(pp_rank * 4, (pp_rank + 1) * 4)
+            observed.append((start, end))
+            hidden = (
+                input_ids.float().unsqueeze(1)
+                if first and start == 0
+                else intermediate_tensors["hidden_states"]
+            )
+            for layer in range(start, end):
+                hidden = hidden + layer + 1
+            return (
+                hidden
+                if last and end == pp_size * 4
+                else IntermediateTensors({"hidden_states": hidden})
+            )
+
+    def capture_on_cpu(self, factory, *args):
+        for desc in self._capture_descs[CUDAGraphMode.FULL]:
+            forward = factory(desc, warmup=False)
+            forward(CUDAGraphMode.NONE)
+            self.graphs[desc] = SimpleNamespace(
+                replay=lambda f=forward: f(CUDAGraphMode.NONE)
+            )
+
+    monkeypatch.setattr(gpu_cudagraph_utils.CudaGraphManager, "capture", capture_on_cpu)
+    buffers = SimpleNamespace(
+        input_ids=torch.ones(4, dtype=torch.long),
+        positions=torch.arange(4),
+        is_padding=torch.ones(4, dtype=torch.bool),
+    )
+    intermediate = IntermediateTensors({"hidden_states": torch.full((4, 1), 3.0)})
+    state = SimpleNamespace(prepare_dummy_inputs=lambda *args: {})
+    manager.capture(Model(), state, buffers, intermediate, None, [], None)
+    for desc in manager.graphs:
+        result = manager.run_fullgraph(desc)
+        group = desc.layer_group_idx
+        start = pp_rank * 4 + (group or 0) * 2
+        end = (pp_rank + 1) * 4 if group is None else start + 2
+        assert observed[-1] == (start, end)
+        final = last and end == pp_size * 4
+        assert isinstance(result, torch.Tensor if final else IntermediateTensors)
+        hidden = result if final else result["hidden_states"]
+        expected = (1 if first and start == 0 else 3) + sum(range(start + 1, end + 1))
+        torch.testing.assert_close(hidden, torch.full((4, 1), float(expected)))
 
 
 def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
@@ -111,6 +215,7 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     with (
         patch.object(gpu_cudagraph_utils, "graph_capture", fake_graph_capture),
         patch.object(gpu_cudagraph_utils, "get_offloader", lambda: fake_offloader),
+        patch.object(gpu_cudagraph_utils, "current_stream", return_value=MagicMock()),
         patch.object(gpu_cudagraph_utils.torch.cuda, "CUDAGraph"),
         patch.object(
             gpu_cudagraph_utils.torch.cuda,

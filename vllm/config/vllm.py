@@ -592,8 +592,7 @@ class VllmConfig:
     @property
     def max_concurrent_batches(self) -> int:
         if self.scheduler_config.num_layer_groups > 1:
-            # Each iteration already contains concurrent work for all PP ranks.
-            # Settle its last-rank output before admitting the next batch.
+            # Settle each local group before advancing the retained batch.
             return 1
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
@@ -722,9 +721,9 @@ class VllmConfig:
     @property
     def use_v2_model_runner(self) -> bool:
         if self.scheduler_config.num_layer_groups > 1:
-            if envs.VLLM_USE_V2_MODEL_RUNNER:
-                raise ValueError("Layered prefill requires Model Runner V1.")
-            return False
+            if envs.VLLM_USE_V2_MODEL_RUNNER is False:
+                raise ValueError("Layered prefill requires Model Runner V2.")
+            return True
         if self.attention_config.hisparse_config is not None:
             if envs.VLLM_USE_V2_MODEL_RUNNER is False:
                 raise ValueError(
@@ -817,6 +816,12 @@ class VllmConfig:
         model_config = self.model_config
         if model_config is None:
             return False
+
+        if (
+            self.scheduler_config.num_layer_groups > 1
+            and not model_config.enforce_eager
+        ):
+            return True
 
         architectures = set(model_config.architectures)
         return bool(architectures & default_breakable_cudagraph_architectures())
@@ -1489,10 +1494,15 @@ class VllmConfig:
         model = self.model_config
         if model is None:
             return
-        supported = {"Qwen2ForCausalLM", "Qwen3ForCausalLM", "Qwen3MoeForCausalLM"}
+        supported = {
+            "Qwen2ForCausalLM",
+            "Qwen3ForCausalLM",
+            "Qwen3MoeForCausalLM",
+            "GptOssForCausalLM",
+        }
         if not supported.intersection(model.architectures):
             raise ValueError(
-                "Layered prefill currently supports Qwen2, Qwen3 and Qwen3 MoE."
+                "Layered prefill supports Qwen2, Qwen3, Qwen3 MoE and GPT-OSS."
             )
         if model.runner_type != "generate" or model.is_multimodal_model:
             raise ValueError("Layered prefill requires text generation.")
@@ -1508,8 +1518,10 @@ class VllmConfig:
                 raise ValueError(
                     "num_layer_groups must not exceed the layer count on any PP rank."
                 )
-        model.enforce_eager = True
-        logger.info("Layered prefill uses eager execution with Model Runner V1.")
+        # Layer selection is Python control flow. Capture each group directly
+        # instead of tracing a single full-depth torch.compile graph.
+        self.compilation_config.mode = CompilationMode.NONE
+        logger.info("Layered prefill uses Model Runner V2 without torch.compile.")
 
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""

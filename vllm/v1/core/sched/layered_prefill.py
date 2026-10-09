@@ -14,15 +14,11 @@ from vllm.v1.request import Request, RequestStatus
 
 
 @dataclass
-class _Prefill:
-    request: Request
+class _PrefillBatch:
+    requests: list[Request]
     first: SchedulerOutput
     continuation: SchedulerOutput
     group: int = 0
-
-    @property
-    def req_id(self) -> str:
-        return self.request.request_id
 
 
 class LayeredPrefillScheduler(Scheduler):
@@ -36,8 +32,8 @@ class LayeredPrefillScheduler(Scheduler):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._num_groups = self.scheduler_config.num_layer_groups
-        self._pending: deque[_Prefill] = deque()
-        self._stages: list[_Prefill | None] = [
+        self._pending: deque[_PrefillBatch] = deque()
+        self._stages: list[_PrefillBatch | None] = [
             None
         ] * self.parallel_config.pipeline_parallel_size
         self._defer_prefill = False
@@ -54,61 +50,79 @@ class LayeredPrefillScheduler(Scheduler):
             self.finished_req_ids = set()
             self.reset_preempted_req_ids = set()
 
-    def _split_batch(self, output: SchedulerOutput) -> None:
+    @staticmethod
+    def _select_requests(output: SchedulerOutput, req_ids: set[str]) -> SchedulerOutput:
         cached = output.scheduled_cached_reqs
-        cached_indices = {req_id: i for i, req_id in enumerate(cached.req_ids)}
-        for req_id, num_tokens in output.num_scheduled_tokens.items():
-            request = self.requests[req_id]
-            continuation = CachedRequestData(
-                req_ids=[req_id],
-                resumed_req_ids=set(),
-                new_token_ids=[[]],
-                all_token_ids={},
-                new_block_ids=[None],
-                num_computed_tokens=[request.num_computed_tokens],
-                num_output_tokens=[request.num_output_tokens],
-            )
-            first_cached = CachedRequestData.make_empty()
-            if req_id in cached_indices:
-                i = cached_indices[req_id]
-                first_cached = CachedRequestData(
-                    req_ids=[req_id],
-                    resumed_req_ids=cached.resumed_req_ids & {req_id},
-                    new_token_ids=[cached.new_token_ids[i]]
-                    if cached.new_token_ids
-                    else [[]],
-                    all_token_ids={req_id: cached.all_token_ids[req_id]}
-                    if req_id in cached.all_token_ids
-                    else {},
-                    new_block_ids=[cached.new_block_ids[i]],
-                    num_computed_tokens=[cached.num_computed_tokens[i]],
-                    num_output_tokens=[cached.num_output_tokens[i]],
-                )
-            first = replace(
-                output,
-                scheduled_new_reqs=[
-                    req for req in output.scheduled_new_reqs if req.req_id == req_id
-                ],
-                scheduled_cached_reqs=first_cached,
-                num_scheduled_tokens={req_id: num_tokens},
-                total_num_scheduled_tokens=num_tokens,
-                num_common_prefix_blocks=[0] * len(output.num_common_prefix_blocks),
-                finished_req_ids=set(),
-                preempted_req_ids=set(),
-                new_block_ids_to_zero=None,
-                kv_cache_block_copies=None,
-            )
-            self._pending.append(
-                _Prefill(
-                    request,
+        indices = [i for i, req_id in enumerate(cached.req_ids) if req_id in req_ids]
+        tokens = {
+            req_id: count
+            for req_id, count in output.num_scheduled_tokens.items()
+            if req_id in req_ids
+        }
+        return replace(
+            output,
+            scheduled_new_reqs=[
+                req for req in output.scheduled_new_reqs if req.req_id in req_ids
+            ],
+            scheduled_cached_reqs=CachedRequestData(
+                req_ids=[cached.req_ids[i] for i in indices],
+                resumed_req_ids=cached.resumed_req_ids & req_ids,
+                new_token_ids=[cached.new_token_ids[i] for i in indices]
+                if cached.new_token_ids
+                else [],
+                all_token_ids={
+                    req_id: ids
+                    for req_id, ids in cached.all_token_ids.items()
+                    if req_id in req_ids
+                },
+                new_block_ids=[cached.new_block_ids[i] for i in indices],
+                num_computed_tokens=[cached.num_computed_tokens[i] for i in indices],
+                num_output_tokens=[cached.num_output_tokens[i] for i in indices],
+            ),
+            num_scheduled_tokens=tokens,
+            total_num_scheduled_tokens=sum(tokens.values()),
+            block_table_updates=(
+                {
+                    req_id: blocks
+                    for req_id, blocks in output.block_table_updates.items()
+                    if req_id in req_ids
+                }
+                if output.block_table_updates is not None
+                else None
+            ),
+        )
+
+    def _enqueue_batch(self, output: SchedulerOutput) -> None:
+        req_ids = list(output.num_scheduled_tokens)
+        requests = [self.requests[req_id] for req_id in req_ids]
+        continuation = CachedRequestData(
+            req_ids=req_ids,
+            resumed_req_ids=set(),
+            new_token_ids=[[] for _ in req_ids],
+            all_token_ids={},
+            new_block_ids=[None] * len(req_ids),
+            num_computed_tokens=[req.num_computed_tokens for req in requests],
+            num_output_tokens=[req.num_output_tokens for req in requests],
+        )
+        first = replace(
+            output,
+            num_common_prefix_blocks=[0] * len(output.num_common_prefix_blocks),
+            finished_req_ids=set(),
+            preempted_req_ids=set(),
+            new_block_ids_to_zero=None,
+            kv_cache_block_copies=None,
+        )
+        self._pending.append(
+            _PrefillBatch(
+                requests,
+                first,
+                replace(
                     first,
-                    replace(
-                        first,
-                        scheduled_new_reqs=[],
-                        scheduled_cached_reqs=continuation,
-                    ),
-                )
+                    scheduled_new_reqs=[],
+                    scheduled_cached_reqs=continuation,
+                ),
             )
+        )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         housekeeping = SchedulerOutput.make_empty()
@@ -116,7 +130,7 @@ class LayeredPrefillScheduler(Scheduler):
             housekeeping = super().schedule(throttle_prefills)
             if not self._defer_prefill:
                 return housekeeping
-            self._split_batch(housekeeping)
+            self._enqueue_batch(housekeeping)
 
         finished = housekeeping.finished_req_ids | self.finished_req_ids
         preempted = (
@@ -125,15 +139,23 @@ class LayeredPrefillScheduler(Scheduler):
         self.finished_req_ids = set()
         self.reset_preempted_req_ids = set()
 
-        def is_active(job: _Prefill) -> bool:
-            return (
-                self.requests.get(job.req_id) is job.request
-                and job.request.status == RequestStatus.RUNNING
-            )
+        def keep_active(job: _PrefillBatch) -> bool:
+            requests = [
+                req
+                for req in job.requests
+                if self.requests.get(req.request_id) is req
+                and req.status == RequestStatus.RUNNING
+            ]
+            if len(requests) != len(job.requests):
+                job.requests = requests
+                req_ids = {req.request_id for req in requests}
+                job.first = self._select_requests(job.first, req_ids)
+                job.continuation = self._select_requests(job.continuation, req_ids)
+            return bool(requests)
 
-        self._pending = deque(job for job in self._pending if is_active(job))
+        self._pending = deque(job for job in self._pending if keep_active(job))
         for rank, job in enumerate(self._stages):
-            if job is not None and not is_active(job):
+            if job is not None and not keep_active(job):
                 self._stages[rank] = None
         paused = self._pause_state == PauseState.PAUSED_ALL
         if not paused and self._stages[0] is None and self._pending:

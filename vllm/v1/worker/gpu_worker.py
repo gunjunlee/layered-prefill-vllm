@@ -93,7 +93,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
-from vllm.v1.worker.layered_prefill import LayeredPrefillRunner
+from vllm.v1.worker.gpu.layered_prefill import LayeredPrefillRunner
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -1285,6 +1285,9 @@ class Worker(WorkerBase):
 
         if scheduler_output.layered_prefill_outputs is not None:
             if self._layered_prefill_runner is None:
+                from vllm.v1.worker.gpu.model_runner import GPUModelRunner as V2Runner
+
+                assert isinstance(self.model_runner, V2Runner)
                 self._layered_prefill_runner = LayeredPrefillRunner(
                     self.model_runner,
                     self.vllm_config.scheduler_config.num_layer_groups,

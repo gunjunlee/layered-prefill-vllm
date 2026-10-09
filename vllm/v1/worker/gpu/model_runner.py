@@ -126,6 +126,10 @@ from vllm.v1.worker.gpu.kv_connector import (
     KVConnector,
     get_kv_connector,
 )
+from vllm.v1.worker.gpu.layered_prefill import (
+    LayeredModelCudaGraphManager,
+    stage_layered_intermediates,
+)
 from vllm.v1.worker.gpu.lora_utils import (
     LoraState,
     create_lora_capture_hook,
@@ -323,6 +327,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
+                max_concurrent_batches=(
+                    1 if self.scheduler_config.num_layer_groups > 1 else None
+                ),
             )
 
         # Samplers and decode_query_len created in load_model() after
@@ -519,9 +526,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.eplb.maybe_start_async_loop(eplb_models_added, load_dummy_weights)
 
-        if not self.is_first_pp_rank:
-            # For non-first PP ranks, create intermediate tensors sized
-            # for the max capture size so they can be sliced per batch.
+        if not self.is_first_pp_rank or self.scheduler_config.num_layer_groups > 1:
+            # PP receives and local layer continuations share persistent inputs
+            # sized for the max capture size so they can be sliced per batch.
             # Save as persistent member so runtime can copy received data
             # into the same addresses that the CUDA graphs captured.
             self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
@@ -736,7 +743,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
         )
-        self.cudagraph_manager = ModelCudaGraphManager(
+        manager_cls = (
+            LayeredModelCudaGraphManager
+            if self.scheduler_config.num_layer_groups > 1
+            else ModelCudaGraphManager
+        )
+        self.cudagraph_manager = manager_cls(
             self.vllm_config,
             self.device,
             cudagraph_mode,
@@ -1705,7 +1717,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
-        intermediate_tensors: IntermediateTensors | None = None,
+        intermediate_tensors: IntermediateTensors
+        | dict[str, IntermediateTensors]
+        | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
@@ -1766,6 +1780,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        layer_group_idx = scheduler_output.layer_group_idx
+        if layer_group_idx is not None:
+            # Group continuations must use the mixed/prefill capture family.
+            uniform_tok_count = max_query_len = None
         batch_desc, dp_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1782,6 +1800,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
         )
+        if layer_group_idx is not None:
+            batch_desc = replace(batch_desc, layer_group_idx=layer_group_idx)
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -1949,7 +1969,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # values above.
             **self.model_state.prepare_inputs(input_batch, self.req_states),
         }
-        if not self.is_first_pp_rank:
+        if isinstance(intermediate_tensors, dict):
+            assert self.intermediate_tensors is not None
+            model_inputs["input_ids"] = model_inputs["inputs_embeds"] = None
+            model_inputs["intermediate_tensors"] = stage_layered_intermediates(
+                self.intermediate_tensors, input_batch, intermediate_tensors
+            )
+        elif not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             model_inputs["input_ids"] = None
             model_inputs["inputs_embeds"] = None
@@ -2001,6 +2027,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_tokens=input_batch.num_tokens_after_padding,
                 has_lora=self.lora_config is not None,
                 num_active_loras=batch_desc.num_active_loras,
+                layer_group_idx=layer_group_idx,
             )
 
             with set_forward_context(
@@ -2037,7 +2064,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.kv_connector.finish_forward()
 
-        if self.is_last_pp_rank:
+        if self.is_last_pp_rank and (
+            layer_group_idx is None
+            or layer_group_idx == self.scheduler_config.num_layer_groups - 1
+        ):
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
                 hidden_states, aux_hidden_states = model_output
@@ -2066,7 +2096,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
 
-        if not self.is_last_pp_rank:
+        if output_intermediate_tensors is not None:
+            if layer_group_idx is not None:
+                return output_intermediate_tensors
             # Non-last PP rank: return IntermediateTensors for sending.
             assert output_intermediate_tensors is not None
             assert self.pp_handler is not None

@@ -59,21 +59,48 @@ DEVICE_TYPE = current_platform.device_type
 
 
 @pytest.mark.cpu_test
-def test_layered_prefill_selects_synchronous_eager_runner(monkeypatch):
+@pytest.mark.parametrize("enforce_eager", [False, True])
+@pytest.mark.parametrize("gpt_oss", [False, True])
+def test_layered_prefill_selects_synchronous_runner(
+    monkeypatch, enforce_eager, gpt_oss, tmp_path
+):
+    from transformers import GptOssConfig, Qwen3Config
+
     monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
-    model = ModelConfig(model="Qwen/Qwen3-0.6B", max_model_len=256)
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    monkeypatch.setattr(vllm_config_module, "HAS_TRITON", True)
+    monkeypatch.setattr(current_platform, "support_static_graph_mode", lambda: True)
+    hf_config = (
+        GptOssConfig(architectures=["GptOssForCausalLM"])
+        if gpt_oss
+        else Qwen3Config(architectures=["Qwen3ForCausalLM"])
+    )
+    hf_config.save_pretrained(tmp_path)
+    model = ModelConfig(
+        model=str(tmp_path), max_model_len=256, enforce_eager=enforce_eager
+    )
     config = VllmConfig(
         model_config=model,
+        device_config=DeviceConfig(device="cpu"),
         scheduler_config=SchedulerConfig(
             max_model_len=256, is_encoder_decoder=False, num_layer_groups=2
         ),
     )
     assert config.max_concurrent_batches == 1
-    assert not config.use_v2_model_runner
+    assert config.use_v2_model_runner
     assert not config.scheduler_config.async_scheduling
-    assert model.enforce_eager
+    assert model.enforce_eager == enforce_eager
     assert config.compilation_config.mode == CompilationMode.NONE
-    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    if enforce_eager:
+        assert config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    else:
+        assert envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+        assert (
+            config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    with pytest.raises(ValueError, match="requires Model Runner V2"):
+        _ = config.use_v2_model_runner
 
 
 @pytest.mark.cpu_test
@@ -82,6 +109,7 @@ def test_layered_prefill_rejects_more_groups_than_local_layers():
     with pytest.raises(ValueError, match="layer count on any PP rank"):
         VllmConfig(
             model_config=model,
+            device_config=DeviceConfig(device="cpu"),
             parallel_config=ParallelConfig(pipeline_parallel_size=2),
             scheduler_config=SchedulerConfig(
                 max_model_len=256,
@@ -803,6 +831,7 @@ def test_dsa_models_default_to_mrv2_and_breakable_cudagraph(
     config = SimpleNamespace(
         model_config=model_config,
         attention_config=AttentionConfig(),
+        scheduler_config=SimpleNamespace(num_layer_groups=1),
         speculative_config=SimpleNamespace(method="mtp") if with_mtp else None,
         parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
         compilation_config=CompilationConfig(
@@ -854,6 +883,7 @@ def test_breakable_cudagraph_platform_default(
     default_breakable_cudagraph_architectures.cache_clear()
     config = SimpleNamespace(
         model_config=SimpleNamespace(architectures=[architecture]),
+        scheduler_config=SimpleNamespace(num_layer_groups=1),
         compilation_config=CompilationConfig(),
     )
     config._uses_breakable_cudagraph_by_default = lambda: (
@@ -907,6 +937,7 @@ def test_batch_invariant_breakable_cudagraph(
     )
     default_breakable_cudagraph_architectures.cache_clear()
     config = object.__new__(VllmConfig)
+    config.scheduler_config = SimpleNamespace(num_layer_groups=1)
     config.model_config = SimpleNamespace(
         architectures=["Qwen3ForCausalLM"],
         enforce_eager=case == "eager",

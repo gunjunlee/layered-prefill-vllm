@@ -16,6 +16,7 @@ import pytest
 
 from vllm.config.model import _FLOAT16_NOT_SUPPORTED_MODELS, RunnerOption
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_config
 
 from ..models.registry import HF_EXAMPLE_MODELS
@@ -24,26 +25,48 @@ from ..utils import compare_two_settings, create_new_process_for_each_test
 logger = init_logger("test_pipeline_parallel")
 
 
-@pytest.mark.parametrize("model", ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-30B-A3B"])
+def _layered_captured_groups(worker):
+    assert worker.use_v2_model_runner
+    manager = worker.model_runner.cudagraph_manager
+    groups = {"FULL": {desc.layer_group_idx for desc in manager.graphs}}
+    if manager.breakable_cg_runner is not None:
+        groups["PIECEWISE"] = {
+            desc.layer_group_idx for desc in manager.breakable_cg_runner.entries
+        }
+    return groups
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="CUDA or ROCm required"
+)
 @pytest.mark.parametrize(
-    "tp,pp,ep", [(1, 2, False), (2, 1, False), (2, 1, True), (2, 2, True)]
+    "model",
+    ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-30B-A3B", "unsloth/gpt-oss-20b-BF16"],
+)
+@pytest.mark.parametrize("enforce_eager", [True, False])
+@pytest.mark.parametrize(
+    "tp,pp,ep",
+    [(1, 1, False), (1, 2, False), (2, 1, False), (2, 1, True), (2, 2, True)],
 )
 def test_layered_prefill_matches_full_depth(
-    vllm_runner, model, tp, pp, ep, num_gpus_available, monkeypatch
+    vllm_runner, model, tp, pp, ep, enforce_eager, num_gpus_available, monkeypatch
 ):
     """Layer boundaries must preserve generation with TP, PP and MoE EP."""
     if num_gpus_available < tp * pp:
         pytest.skip(f"Requires {tp * pp} GPUs")
-    if ep and "A3B" not in model:
+    if ep and "A3B" not in model and "gpt-oss" not in model:
         pytest.skip("EP applies to the MoE model")
-    _compare_layered_prefill(vllm_runner, model, tp, pp, ep, monkeypatch)
+    _compare_layered_prefill(vllm_runner, model, tp, pp, ep, enforce_eager, monkeypatch)
 
 
 @create_new_process_for_each_test()
-def _compare_layered_prefill(vllm_runner, model, tp, pp, ep, monkeypatch):
+def _compare_layered_prefill(
+    vllm_runner, model, tp, pp, ep, enforce_eager, monkeypatch
+):
     from tests.models.utils import check_logprobs_close
 
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
 
     prompts = [
         "The capital of France is",
@@ -58,7 +81,8 @@ def _compare_layered_prefill(vllm_runner, model, tp, pp, ep, monkeypatch):
             pipeline_parallel_size=pp,
             enable_expert_parallel=ep,
             distributed_executor_backend="mp",
-            enforce_eager=True,
+            enforce_eager=True if groups == 1 else enforce_eager,
+            compilation_config={"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32]},
             async_scheduling=False,
             num_layer_groups=groups,
             max_model_len=256,
@@ -66,9 +90,13 @@ def _compare_layered_prefill(vllm_runner, model, tp, pp, ep, monkeypatch):
             max_num_seqs=4,
             enable_chunked_prefill=True,
             enable_prefix_caching=True,
-            gpu_memory_utilization=0.5 if "A3B" in model else 0.1,
+            gpu_memory_utilization=0.5 if "A3B" in model or "gpt-oss" in model else 0.1,
             kv_cache_memory_bytes=256 * 1024**2,
         ) as runner:
+            if groups > 1 and not enforce_eager:
+                for captures in runner.collective_rpc(_layered_captured_groups):
+                    assert captures["PIECEWISE"] == {None, 0, 1}
+                    assert captures["FULL"] == {None}
             results.append(runner.generate_greedy_logprobs(prompts, 8, 5))
             # Reuse completed prefixes after the pipeline has drained.
             repeated = runner.generate_greedy_logprobs(prompts, 8, 5)

@@ -35,6 +35,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItem,
     PlaceholderRange,
 )
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
@@ -77,28 +78,40 @@ from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 pytestmark = pytest.mark.cpu_test
 
 
+def create_layered_scheduler(**kwargs):
+    # These scheduler-only tests run on hosts without a Triton GPU backend.
+    with (
+        patch("vllm.config.vllm.HAS_TRITON", True),
+        patch.object(current_platform, "device_type", "cpu"),
+    ):
+        return create_scheduler(use_v2_model_runner=True, **kwargs)
+
+
 @pytest.mark.parametrize("pp_size,num_groups", [(1, 2), (2, 2), (2, 3), (3, 2)])
 def test_layered_prefill_advances_within_each_pipeline_rank(pp_size, num_groups):
-    """A request occupies a PP rank for all its local layer groups."""
-    scheduler = create_scheduler(
+    """Keep the admitted batch intact through every local layer group."""
+    scheduler = create_layered_scheduler(
         model="Qwen/Qwen3-0.6B",
         pipeline_parallel_size=pp_size,
         num_layer_groups=num_groups,
+        max_num_batched_tokens=32,
     )
     requests = create_requests(num_requests=2, num_tokens=16, max_tokens=2)
     for request in requests:
         scheduler.add_request(request)
-    for tick in range((pp_size + 1) * num_groups):
+    for tick in range(pp_size * num_groups):
         output = scheduler.schedule()
         stages = output.layered_prefill_outputs
         assert stages is not None
         for rank, stage in enumerate(stages):
-            active = []
-            for index, request in enumerate(requests):
-                progress = tick - index * num_groups
-                if rank * num_groups <= progress < (rank + 1) * num_groups:
-                    active.append(request.request_id)
-                    assert stage.layer_group_idx == progress % num_groups
+            active = (
+                [req.request_id for req in requests]
+                if rank * num_groups <= tick < (rank + 1) * num_groups
+                else []
+            )
+            if active:
+                assert stage.layer_group_idx == tick % num_groups
+                assert stage.total_num_scheduled_tokens == 32
             assert list(stage.num_scheduled_tokens) == active
         completed = stages[-1]
         ids = list(completed.num_scheduled_tokens)
@@ -113,34 +126,114 @@ def test_layered_prefill_advances_within_each_pipeline_rank(pp_size, num_groups)
             pooler_output=[],
         )
         scheduler.update_from_output(output, model_output)
-        for index, request in enumerate(requests):
-            done = tick >= (pp_size + index) * num_groups - 1
+        for request in requests:
+            done = tick == pp_size * num_groups - 1
             assert request.num_computed_tokens == (16 if done else 0)
             assert request.num_output_tokens == int(done)
     # Once prefill drains, decode remains a normal full-depth batch.
     assert scheduler.schedule().layered_prefill_outputs is None
 
 
-def test_layered_prefill_abort_releases_pipeline_slot():
-    scheduler = create_scheduler(
+@pytest.mark.parametrize("abort_after", [1, 2, 3])
+def test_layered_prefill_abort_preserves_other_batch_members(abort_after):
+    scheduler = create_layered_scheduler(
         model="Qwen/Qwen3-0.6B", pipeline_parallel_size=2, num_layer_groups=2
     )
     requests = create_requests(num_requests=2, num_tokens=16)
     for request in requests:
         scheduler.add_request(request)
-    scheduler.schedule()
+    for _ in range(abort_after):
+        scheduler.schedule()
     scheduler.finish_requests([requests[0].request_id], RequestStatus.FINISHED_ABORTED)
     output = scheduler.schedule()
     assert requests[0].request_id in output.finished_req_ids
-    assert output.layered_prefill_outputs[0].num_scheduled_tokens == {
-        requests[1].request_id: 16
-    }
-    assert output.layered_prefill_outputs[0].layer_group_idx == 0
-    assert not output.layered_prefill_outputs[1].num_scheduled_tokens
+    rank = abort_after // 2
+    stage = output.layered_prefill_outputs[rank]
+    assert stage.num_scheduled_tokens == {requests[1].request_id: 16}
+    assert stage.layer_group_idx == abort_after % 2
+    if stage.layer_group_idx:
+        assert stage.scheduled_cached_reqs.req_ids == [requests[1].request_id]
+    else:
+        assert [req.req_id for req in stage.scheduled_new_reqs] == [
+            requests[1].request_id
+        ]
+    assert not output.layered_prefill_outputs[1 - rank].num_scheduled_tokens
+
+
+def test_layered_prefill_keeps_new_arrivals_out_of_current_batch():
+    scheduler = create_layered_scheduler(
+        model="Qwen/Qwen3-0.6B", pipeline_parallel_size=2, num_layer_groups=2
+    )
+    first, second, late = create_requests(num_requests=3, max_tokens=1)
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+    scheduler.schedule()
+    scheduler.add_request(late)
+    for _ in range(3):
+        output = scheduler.schedule()
+        assert set(output.num_scheduled_tokens) == {first.request_id, second.request_id}
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[first.request_id, second.request_id],
+            req_id_to_index={first.request_id: 0, second.request_id: 1},
+            sampled_token_ids=[[123], [123]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    assert scheduler.schedule().num_scheduled_tokens == {late.request_id: 10}
+
+
+def test_layered_prefill_batches_cached_decode_with_new_prefills():
+    scheduler = create_layered_scheduler(
+        model="Qwen/Qwen3-0.6B",
+        pipeline_parallel_size=2,
+        num_layer_groups=2,
+        max_num_batched_tokens=17,
+    )
+    decode, first, second = create_requests(num_requests=3, num_tokens=8, max_tokens=4)
+    scheduler.add_request(decode)
+    for _ in range(4):
+        output = scheduler.schedule()
+    _model_output(scheduler, output, [[123]])
+
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+    expected = {decode.request_id: 1, first.request_id: 8, second.request_id: 8}
+    for tick in range(4):
+        output = scheduler.schedule()
+        stage = output.layered_prefill_outputs[tick // 2]
+        assert stage.num_scheduled_tokens == expected
+        assert stage.total_num_scheduled_tokens == 17
+        cached = stage.scheduled_cached_reqs
+        if tick % 2 == 0:
+            assert [req.req_id for req in stage.scheduled_new_reqs] == [
+                first.request_id,
+                second.request_id,
+            ]
+            assert cached.req_ids == [decode.request_id]
+            assert cached.new_token_ids == [[123]]
+        else:
+            assert cached.req_ids == list(expected)
+            assert cached.num_computed_tokens == [8, 0, 0]
+            assert cached.new_token_ids == [[], [], []]
+        assert decode.num_computed_tokens == 8 + (tick == 3)
+        assert (
+            first.num_computed_tokens
+            == second.num_computed_tokens
+            == (8 if tick == 3 else 0)
+        )
+    _model_output(scheduler, output, [[124], [125], [126]])
+    assert list(decode.output_token_ids) == [123, 124]
+    assert list(first.output_token_ids) == [125]
+    assert list(second.output_token_ids) == [126]
+    assert scheduler.schedule().layered_prefill_outputs is None
 
 
 def test_layered_prefill_keeps_partial_kv_out_of_prefix_cache():
-    scheduler = create_scheduler(
+    scheduler = create_layered_scheduler(
         model="Qwen/Qwen3-0.6B",
         pipeline_parallel_size=2,
         num_layer_groups=2,
@@ -169,7 +262,7 @@ def test_layered_prefill_keeps_partial_kv_out_of_prefix_cache():
 
 
 def test_layered_prefill_pause_preserves_local_group():
-    scheduler = create_scheduler(
+    scheduler = create_layered_scheduler(
         model="Qwen/Qwen3-0.6B", pipeline_parallel_size=2, num_layer_groups=2
     )
     (request,) = create_requests(num_requests=1)
@@ -182,7 +275,7 @@ def test_layered_prefill_pause_preserves_local_group():
 
 
 def test_layered_prefill_commits_each_token_chunk_once():
-    scheduler = create_scheduler(
+    scheduler = create_layered_scheduler(
         model="Qwen/Qwen3-0.6B",
         pipeline_parallel_size=2,
         num_layer_groups=2,
@@ -209,6 +302,31 @@ def test_layered_prefill_commits_each_token_chunk_once():
             )
             assert request.num_computed_tokens == 16 * (chunk + completed)
             assert request.num_output_tokens == int(chunk == 2 and completed)
+
+
+def test_layered_prefill_batches_full_and_partial_prompts_within_token_budget():
+    scheduler = create_layered_scheduler(
+        model="Qwen/Qwen3-0.6B",
+        pipeline_parallel_size=2,
+        num_layer_groups=2,
+        max_num_batched_tokens=32,
+    )
+    first, second = create_requests(num_requests=2, num_tokens=24, max_tokens=1)
+    for req in (first, second):
+        scheduler.add_request(req)
+    for counts, sampled in (
+        ({first.request_id: 24, second.request_id: 8}, [[123], []]),
+        ({second.request_id: 16}, [[124]]),
+    ):
+        for tick in range(4):
+            output = scheduler.schedule()
+            stage = output.layered_prefill_outputs[tick // 2]
+            assert stage.num_scheduled_tokens == counts
+            assert stage.total_num_scheduled_tokens == sum(counts.values())
+        _model_output(scheduler, output, sampled)
+    assert list(first.output_token_ids) == [123]
+    assert list(second.output_token_ids) == [124]
+    assert not scheduler.has_unfinished_requests()
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
